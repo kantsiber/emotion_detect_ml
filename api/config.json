@@ -1,0 +1,11 @@
+{
+  "check_points_path": "checkpoints/base_model",
+  "train_csv_path": "data/balanced_train_set.csv",
+  "test_csv_path": "data/balanced_test_set.csv",
+  "prefix_for_file_path": "E:/Python_projects/Datasets/crowd/crowd_train/",
+  "test_prefix_for_file_path": "E:/Python_projects/Datasets/crowd/crowd_test/",
+  "target_sample_rate": 16000,
+  "batch_size": 32,
+  "num_classes": 4,
+  "lr": 0.0001
+}
