@@ -76,8 +76,8 @@ TASK_FILES_DIR.mkdir(parents=True, exist_ok=True)
 # =========================================================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-epoch_num = 1
-model_path = f"../checkpoints/base_model/model_check_points/check_point_{epoch_num}.pth"
+epoch_num = 9
+model_path = f"checkpoints/base_model/model_check_points/check_point_{epoch_num}.pth"
 
 model = EmoModel(num_classes=num_classes)
 checkpoint = torch.load(model_path, map_location=device, weights_only=False)
@@ -883,4 +883,4 @@ if __name__ == "__main__":
     print(f"Документация: http://localhost:8080/docs")
     print("=" * 70 + "\n")
 
-    uvicorn.run(app, host="127.0.0.1", port=8080, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=8080, log_level="info")
