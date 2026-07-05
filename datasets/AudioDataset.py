@@ -5,6 +5,7 @@ import torchaudio.transforms as T
 import torchaudio.functional as F
 import pandas as pd
 from torch.utils.data import Dataset
+from transformers import ASTFeatureExtractor
 
 
 class AudioDataset(Dataset):
@@ -25,12 +26,14 @@ class AudioDataset(Dataset):
             'positive': 3
         }
 
-        self.mel_transform = T.MelSpectrogram(
-            sample_rate=target_sample_rate,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            n_mels=n_mels
-        )
+        # self.mel_transform = T.MelSpectrogram(
+        #     sample_rate=target_sample_rate,
+        #     n_fft=n_fft,
+        #     hop_length=hop_length,
+        #     n_mels=n_mels
+        # )
+        self.feature_extractor = ASTFeatureExtractor.from_pretrained("MIT/ast-finetuned-audioset-10-10-0.4593")
+
 
     def __len__(self):
         return len(self.df)
@@ -54,8 +57,28 @@ class AudioDataset(Dataset):
             padding = self.target_length - current_length
             waveform = torch.nn.functional.pad(waveform, (0, padding))
 
-        mel_spec = self.mel_transform(waveform)
-        mel_spec = torch.log(mel_spec + 1e-6)
-        mel_spec = (mel_spec - mel_spec.mean()) / (mel_spec.std() + 1e-6)
+        # mel_spec = self.mel_transform(waveform)
+        # mel_spec = torch.log(mel_spec + 1e-6)
+        # mel_spec = (mel_spec - mel_spec.mean()) / (mel_spec.std() + 1e-6)
 
-        return mel_spec, label
+
+        # return mel_spec, label
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+
+        inputs = self.feature_extractor(
+            waveform.squeeze(0).numpy(),
+            sampling_rate=self.target_sample_rate,
+            return_tensors="pt",
+        )
+        input_values = inputs["input_values"].squeeze(0)
+
+        return input_values, label
+
+
+if __name__ == "__main__":
+    dataset = AudioDataset(csv_file="файл.csv", prefix_path="путь/")
+    input_values, label = dataset[0]
+    # ожидаем на выходе 1024, 128  и label 0-3
+    print("shape:", input_values.shape)
+    print("label:", label)
