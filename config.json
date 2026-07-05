@@ -8,5 +8,6 @@
   "target_sample_rate": 16000,
   "batch_size": 32,
   "num_classes": 4,
-  "lr": 0.00001
+  "lr": 0.00001,
+  "freeze_first_n_layers": 6
 }

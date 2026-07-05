@@ -183,7 +183,7 @@ train_dataloader = DataLoader(train_dataset, batch_size=config.batch_size, shuff
 val_dataloader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = EmoModelAST(num_classes=config.num_classes, freeze_first_n_layers=6)
+model = EmoModelAST(num_classes=config.num_classes, freeze_first_n_layers=config.freeze_first_n_layers)
 model = model.to(device)
 
 # loss_fun = nn.MSELoss()
