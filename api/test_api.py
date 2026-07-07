@@ -1,4 +1,5 @@
 import json
+import uvicorn
 import subprocess
 import torch
 import asyncio
@@ -17,6 +18,8 @@ from fastapi.responses import FileResponse
 from starlette.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from models.EmoModel_base import EmoModel
+from models.EmoModelKelon import EmoModelKelon
+from models.EmoModelAST import EmoModelAST
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
@@ -90,6 +93,19 @@ print(f"target_time (train chunk) из конфига: {target_time} сек")
 print(f"sample_rate target: {target_sample_rate} Hz")
 print(f"hop_length: {hop_length}, n_fft: {n_fft}, n_mels: {n_mels}")
 
+
+model_kelon = EmoModelKelon(device=device)
+
+ast_epoch_num = None
+ast_model_path = f"checkpoints/ast_model/model_check_points_ast/check_point_{ast_epoch_num}.pth"
+
+ast_model = EmoModelAST(num_classes=num_classes, freeze_first_n_layers=6)
+ast_checkpoint = torch.load(ast_model_path, map_location=device, weights_only=False)
+ast_model.load_state_dict(ast_checkpoint["model_state_dict"])
+ast_model = ast_model.to(device)
+ast_model.eval()
+
+print(f"AST-модель загружена на {device}, эпоха чекпоинта: {ast_epoch_num}")
 # =========================================================
 # Transforms
 # =========================================================
@@ -204,8 +220,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Emotion Recognition API",
-    version="3.2.0",
-    description="API для распознавания эмоций в аудио с использованием CNN",
+    version="3.3.0",
+    description="API для распознавания эмоций и лжи в аудио",
     lifespan=lifespan
 )
 
@@ -262,16 +278,38 @@ async def process_task_queue():
                 await asyncio.sleep(0.2)
 
             active_tasks += 1
-            asyncio.create_task(
-                process_audio_with_semaphore(
-                    task_data["task_id"],
-                    task_data["waveform"],
-                    task_data["sample_rate"],
-                    task_data["window_ms"],
-                    task_data["stride_ms"],
-                    task_data.get("model_name"),
+
+            if task_data.get("model_name") == "kelon":
+                asyncio.create_task(
+                    process_audio_with_semaphore_kelon(
+                        task_data["task_id"],
+                        task_data["waveform"],
+                        task_data["sample_rate"],
+                        task_data["window_ms"],
+                        task_data["stride_ms"],
+                    )
                 )
-            )
+            elif task_data.get("model_name") == "ast":
+                asyncio.create_task(
+                    process_audio_with_semaphore_ast(
+                        task_data["task_id"],
+                        task_data["waveform"],
+                        task_data["sample_rate"],
+                        task_data["window_ms"],
+                        task_data["stride_ms"],
+                    )
+                )
+            else:
+                asyncio.create_task(
+                    process_audio_with_semaphore(
+                        task_data["task_id"],
+                        task_data["waveform"],
+                        task_data["sample_rate"],
+                        task_data["window_ms"],
+                        task_data["stride_ms"],
+                        task_data.get("model_name"),
+                    )
+                )
             task_queue.task_done()
 
         except Exception as e:
@@ -773,8 +811,12 @@ def create_mock_task_result(task_id: str) -> Dict:
 async def health_check():
     return {
         "status": "healthy",
-        "model_loaded": model is not None,
         "device": str(device),
+        "models_loaded": {
+            "vgg": model is not None,
+            "kelon": model_kelon is not None,
+            "ast": ast_model is not None,
+        },
         "tasks_count": len(tasks_storage),
         "tasks_active": active_tasks,
         "tasks_queued": task_queue.qsize(),
@@ -786,7 +828,11 @@ async def health_check():
             "n_fft": n_fft,
             "hop_length": hop_length,
             "emotions": list(emotion_to_label.keys()),
-            "checkpoint": str(Path(model_path).name),
+            "vgg_checkpoint": str(Path(model_path).name),
+            "ast_checkpoint": (
+                f"check_point_{ast_epoch_num}.pth" if ast_model is not None else None
+            ),
+            "kelon_model": "KELONMYOSA/wav2vec2-xls-r-300m-emotion-ru",
             "opensmile_feature_set": "eGeMAPSv02",
         },
     }
@@ -810,15 +856,25 @@ async def get_stats():
 async def root():
     return {
         "message": "Emotion Recognition API",
-        "model": "EmoModel (CNN)",
-        "version": "3.2.0",
+        "version": "3.3.0",
+        "models": {
+            "vgg": "EmoModel (CNN) - базовая модель",
+            "ast": "Audio Spectrogram Transformer (fine-tuned)" + (
+                "" if ast_model is not None else " - недоступна, нет обученного чекпоинта"
+            ),
+            "kelon": "wav2vec2-xls-r-300m-emotion-ru (предобученная, без дообучения)",
+        },
         "emotions": list(emotion_to_label.keys()),
         "endpoints": {
-            "upload": "POST /api/upload",
+            "upload_vgg": "POST /api/upload",
+            "upload_kelon": "POST /api/kelon/upload",
+            "upload_ast": "POST /api/ast/upload",
             "task_status": "GET /api/task/{task_id}",
             "delete_task": "DELETE /api/task/{task_id}",
             "list_tasks": "GET /api/tasks",
+            "download_features": "GET /api/task/{task_id}/features.csv",
             "health": "GET /health",
+            "stats": "GET /stats",
             "docs": "GET /docs",
         },
     }
@@ -864,19 +920,368 @@ async def list_tasks():
 
 
 # =========================================================
+# Полный блок для kelon
+# =========================================================
+
+async def process_audio_tensor_kelon(
+    task_id: str,
+    waveform: torch.Tensor,
+    sample_rate: int,
+    window_ms: int,
+    stride_ms: int,
+):
+    try:
+        tasks_storage[task_id]["status"] = "processing"
+        tasks_storage[task_id]["progress"] = 0.05
+
+        loop = asyncio.get_event_loop()
+
+        if waveform.dim() == 2 and waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+
+        total_len = int(waveform.shape[1])
+        win_len = int(sample_rate * (window_ms / 1000.0))
+        hop_len = int(sample_rate * (stride_ms / 1000.0))
+
+        if win_len <= 0:
+            win_len = int(sample_rate * 3.0)
+        if hop_len <= 0:
+            hop_len = win_len
+
+        starts = list(range(0, max(total_len - 1, 1), hop_len))
+        if len(starts) == 0:
+            starts = [0]
+        if starts[-1] + win_len < total_len:
+            starts.append(max(total_len - win_len, 0))
+
+        n_windows = len(starts)
+        segments = []
+
+        for idx, s0 in enumerate(starts):
+            s1 = min(s0 + win_len, total_len)
+            window_wave = waveform[:, s0:s1]
+
+            label, scores = await loop.run_in_executor(
+                executor, model_kelon.predict_from_waveform, window_wave, sample_rate
+            )
+
+            segments.append({
+                "label": label,
+                "startMs": int(s0 / sample_rate * 1000),
+                "endMs": int(s1 / sample_rate * 1000),
+                "scores": scores,
+            })
+
+            tasks_storage[task_id]["progress"] = 0.1 + 0.85 * ((idx + 1) / max(n_windows, 1))
+
+        emotion_counts = {e: 0 for e in emotion_to_label.keys()}
+        for seg in segments:
+            emotion_counts[seg["label"]] += 1
+        main_emotion = max(emotion_counts, key=emotion_counts.get)
+
+        tasks_storage[task_id].update({
+            "status": "done",
+            "progress": 1.0,
+            "summary": {"mainEmotion": main_emotion, "emotionCounts": emotion_counts},
+            "segments": segments,
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        tasks_storage[task_id]["status"] = "error"
+        tasks_storage[task_id]["error"] = str(e)
+        tasks_storage[task_id]["progress"] = 0.0
+
+
+
+async def process_audio_with_semaphore_kelon(
+    task_id: str,
+    waveform: torch.Tensor,
+    sample_rate: int,
+    window_ms: int,
+    stride_ms: int,
+):
+    global active_tasks
+    try:
+        await process_audio_tensor_kelon(task_id, waveform, sample_rate, window_ms, stride_ms)
+    finally:
+        active_tasks -= 1
+
+
+
+@app.post("/api/kelon/upload")
+async def upload_audio_kelon(
+    audio: UploadFile = File(...),
+    window_ms: Optional[int] = Form(None),
+    stride_ms: Optional[int] = Form(None),
+):
+    try:
+        content = await audio.read()
+        if len(content) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Файл слишком большой. Максимум: {MAX_FILE_SIZE / 1024 / 1024:.0f}MB"
+            )
+
+        task_id = str(uuid.uuid4())
+
+        if window_ms is None:
+            window_ms = 3000
+        if stride_ms is None:
+            stride_ms = window_ms
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(audio.filename).suffix) as tmp_file:
+            tmp_file.write(content)
+            tmp_path = tmp_file.name
+
+        try:
+            file_suffix = Path(audio.filename).suffix.lower()
+
+            if file_suffix in [".webm", ".ogg", ".opus"]:
+                converted_path = convert_to_wav(tmp_path)
+                waveform, sample_rate = torchaudio.load(converted_path)
+                os.unlink(converted_path)
+            else:
+                waveform, sample_rate = torchaudio.load(tmp_path)
+
+            duration = float(waveform.shape[1] / sample_rate)
+
+            if duration < MIN_AUDIO_DURATION:
+                raise HTTPException(status_code=400, detail=f"Аудио слишком короткое: {duration:.2f} сек")
+            if duration > MAX_AUDIO_DURATION:
+                raise HTTPException(status_code=400, detail=f"Аудио слишком длинное: {duration/60:.2f} мин")
+
+            if waveform.dim() == 2 and waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)
+
+        finally:
+            os.unlink(tmp_path)
+
+        tasks_storage[task_id] = {
+            "taskId": task_id,
+            "status": "queued",
+            "progress": 0.0,
+            "created_at": datetime.now(),
+            "filename": audio.filename,
+            "duration": duration,
+            "window_ms": window_ms,
+            "stride_ms": stride_ms,
+            "model": "kelon",
+        }
+
+        await task_queue.put({
+            "task_id": task_id,
+            "waveform": waveform,
+            "sample_rate": sample_rate,
+            "window_ms": window_ms,
+            "stride_ms": stride_ms,
+            "model_name": "kelon",
+        })
+
+        return {
+            "ok": True,
+            "taskId": task_id,
+            "status": "queued",
+            "queuePosition": task_queue.qsize(),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =========================================================
+# Полный блок для ast
+# =========================================================
+
+async def process_audio_tensor_ast(
+        task_id: str,
+        waveform: torch.Tensor,
+        sample_rate: int,
+        window_ms: int,
+        stride_ms: int,
+):
+    try:
+        tasks_storage[task_id]["status"] = "processing"
+        tasks_storage[task_id]["progress"] = 0.05
+
+        loop = asyncio.get_event_loop()
+
+        if waveform.dim() == 2 and waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+
+        total_len = int(waveform.shape[1])
+        win_len = int(sample_rate * (window_ms / 1000.0))
+        hop_len = int(sample_rate * (stride_ms / 1000.0))
+
+        if win_len <= 0:
+            win_len = int(sample_rate * 3.0)
+        if hop_len <= 0:
+            hop_len = win_len
+
+        starts = list(range(0, max(total_len - 1, 1), hop_len))
+        if len(starts) == 0:
+            starts = [0]
+        if starts[-1] + win_len < total_len:
+            starts.append(max(total_len - win_len, 0))
+
+        n_windows = len(starts)
+        segments = []
+
+        for idx, s0 in enumerate(starts):
+            s1 = min(s0 + win_len, total_len)
+            window_wave = waveform[:, s0:s1]
+
+            label, scores = await loop.run_in_executor(
+                executor, ast_model.predict_from_waveform, window_wave, sample_rate
+            )
+
+            segments.append({
+                "label": label,
+                "startMs": int(s0 / sample_rate * 1000),
+                "endMs": int(s1 / sample_rate * 1000),
+                "scores": scores,
+            })
+
+            tasks_storage[task_id]["progress"] = 0.1 + 0.85 * ((idx + 1) / max(n_windows, 1))
+
+        emotion_counts = {e: 0 for e in emotion_to_label.keys()}
+        for seg in segments:
+            emotion_counts[seg["label"]] += 1
+        main_emotion = max(emotion_counts, key=emotion_counts.get)
+
+        tasks_storage[task_id].update({
+            "status": "done",
+            "progress": 1.0,
+            "summary": {"mainEmotion": main_emotion, "emotionCounts": emotion_counts},
+            "segments": segments,
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        tasks_storage[task_id]["status"] = "error"
+        tasks_storage[task_id]["error"] = str(e)
+        tasks_storage[task_id]["progress"] = 0.0
+
+
+
+async def process_audio_with_semaphore_ast(
+    task_id: str,
+    waveform: torch.Tensor,
+    sample_rate: int,
+    window_ms: int,
+    stride_ms: int,
+):
+    global active_tasks
+    try:
+        await process_audio_tensor_ast(task_id, waveform, sample_rate, window_ms, stride_ms)
+    finally:
+        active_tasks -= 1
+
+
+@app.post("/api/ast/upload")
+async def upload_audio_ast(
+    audio: UploadFile = File(...),
+    window_ms: Optional[int] = Form(None),
+    stride_ms: Optional[int] = Form(None),
+):
+    try:
+        content = await audio.read()
+        if len(content) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Файл слишком большой. Максимум: {MAX_FILE_SIZE / 1024 / 1024:.0f}MB"
+            )
+
+        task_id = str(uuid.uuid4())
+
+        if window_ms is None:
+            window_ms = 3000
+        if stride_ms is None:
+            stride_ms = window_ms
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(audio.filename).suffix) as tmp_file:
+            tmp_file.write(content)
+            tmp_path = tmp_file.name
+
+        try:
+            file_suffix = Path(audio.filename).suffix.lower()
+
+            if file_suffix in [".webm", ".ogg", ".opus"]:
+                converted_path = convert_to_wav(tmp_path)
+                waveform, sample_rate = torchaudio.load(converted_path)
+                os.unlink(converted_path)
+            else:
+                waveform, sample_rate = torchaudio.load(tmp_path)
+
+            duration = float(waveform.shape[1] / sample_rate)
+
+            if duration < MIN_AUDIO_DURATION:
+                raise HTTPException(status_code=400, detail=f"Аудио слишком короткое: {duration:.2f} сек")
+            if duration > MAX_AUDIO_DURATION:
+                raise HTTPException(status_code=400, detail=f"Аудио слишком длинное: {duration/60:.2f} мин")
+
+            if waveform.dim() == 2 and waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)
+
+        finally:
+            os.unlink(tmp_path)
+
+        tasks_storage[task_id] = {
+            "taskId": task_id,
+            "status": "queued",
+            "progress": 0.0,
+            "created_at": datetime.now(),
+            "filename": audio.filename,
+            "duration": duration,
+            "window_ms": window_ms,
+            "stride_ms": stride_ms,
+            "model": "ast",
+        }
+
+        await task_queue.put({
+            "task_id": task_id,
+            "waveform": waveform,
+            "sample_rate": sample_rate,
+            "window_ms": window_ms,
+            "stride_ms": stride_ms,
+            "model_name": "ast",
+        })
+
+        return {
+            "ok": True,
+            "taskId": task_id,
+            "status": "queued",
+            "queuePosition": task_queue.qsize(),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =========================================================
 # Run
 # =========================================================
 if __name__ == "__main__":
-    import uvicorn
-
     print("\n" + "=" * 70)
-    print("EMOTION RECOGNITION API v3.2.0 (FULL AUDIO WINDOWS)")
+    print("EMOTION RECOGNITION API v3.3.0 (FULL AUDIO WINDOWS)")
     print("=" * 70)
-    print(f"Модель: EmoModel (CNN)")
-    print(f"Классов: {num_classes}")
-    print(f"Эмоции: {', '.join(emotion_to_label.keys())}")
     print(f"Устройство: {device}")
-    print(f"Чекпоинт: {model_path}")
+    print(f"Эмоции: {', '.join(emotion_to_label.keys())}")
+    print()
+    print(f"VGG чекпоинт: {model_path}")
+    print(f"Kelon wav2vec2-xls-r-300m-emotion-ru (предобучена, без дообучения)")
+    print(f"AST  {'чекпоинт: check_point_' + str(ast_epoch_num) + '.pth' if ast_model is not None else 'НЕ ЗАГРУЖЕНА, эндпоинт /api/ast/upload вернёт 503'}")
+    print()
     print(f"Train chunk (target_time): {target_time} сек")
     print(f"Sample rate: {target_sample_rate} Hz")
     print(f"API адрес: http://localhost:8080")
