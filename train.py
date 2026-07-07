@@ -161,7 +161,7 @@ from pathlib import Path
 
 args = parse_args()
 config = read_config(args.config_path)
-os.makedirs(config.check_points_path + f"/model_check_points/", exist_ok=False)
+os.makedirs(config.check_points_path + f"/model_check_points_ast/", exist_ok=False)
 copy_json(args.config_path, config.check_points_path + "/config.json")
 current_file = Path(__file__).resolve()
 destination = Path(config.check_points_path + '/train.py')
@@ -298,6 +298,6 @@ for epoch in tqdm(range(1, epochs), desc="Обучение модели"):
             'train_recall': train_recall,
             'val_precision': val_precision,
             'val_recall': val_recall,
-        }, config.check_points_path + f"/model_check_points/check_point_{epoch_num}.pth")
+        }, config.check_points_path + f"/model_check_points_ast/check_point_{epoch_num}.pth")
 
 writer.close()
