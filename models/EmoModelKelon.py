@@ -5,7 +5,7 @@ import torch.nn.functional as nnF
 from transformers import AutoConfig, Wav2Vec2Processor, AutoModelForAudioClassification
 
 
-class RuEmotionClassifier:
+class EmoModelKelon:
     def __init__(self, model_name="KELONMYOSA/wav2vec2-xls-r-300m-emotion-ru", device=None):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -32,9 +32,7 @@ class RuEmotionClassifier:
         return waveform.squeeze(0).numpy()
 
     @torch.no_grad()
-    def predict(self, audio_path):
-        speech = self._load_waveform(audio_path)
-
+    def _predict_from_array(self, speech):
         features = self.processor(
             speech, sampling_rate=self.sampling_rate, return_tensors="pt", padding=True
         )
@@ -50,5 +48,20 @@ class RuEmotionClassifier:
         normalized = {k: round(v / total, 5) for k, v in filtered.items()}
 
         predicted_label = max(normalized, key=normalized.get)
-
         return predicted_label, normalized
+
+    def predict(self, audio_path):
+        speech = self._load_waveform(audio_path)
+        return self._predict_from_array(speech)
+
+    def predict_from_waveform(self, waveform, sample_rate):
+        if sample_rate != self.sampling_rate:
+            waveform = F.resample(waveform, sample_rate, self.sampling_rate)
+
+        if waveform.dim() == 2 and waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        if waveform.dim() == 2:
+            waveform = waveform.squeeze(0)
+
+        speech = waveform.numpy()
+        return self._predict_from_array(speech)
