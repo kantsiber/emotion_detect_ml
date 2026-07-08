@@ -33,7 +33,7 @@ import random
 # Config
 # =========================================================
 def load_config(config_path: str) -> dict:
-    """Загрузка конфигурационного файла"""
+    """Загружает конфигурационный JSON-файл с диска."""
     with open(config_path, "r") as f:
         return json.load(f)
 
@@ -45,14 +45,12 @@ config = load_config(config_path)
 checkpoints_dir = config["check_points_path"]
 num_classes = config["num_classes"]
 target_sample_rate = int(config["target_sample_rate"])
-target_time = float(config.get("target_time", 3.0))  # модель обучалась на target_time секунд
+target_time = float(config.get("target_time", 3.0))
 
-# Параметры спектрограммы (как в датасете)
 n_mels = 80
 n_fft = 1024
 hop_length = 256
 
-# Маппинг эмоций
 emotion_to_label = {
     "neutral": 0,
     "sad": 1,
@@ -61,16 +59,12 @@ emotion_to_label = {
 }
 label_to_emotion = {v: k for k, v in emotion_to_label.items()}
 
-# =========================================================
-# Ограничения (оставил как было; если хочешь убрать — скажи)
-# =========================================================
 MIN_AUDIO_DURATION = 0.5
 MAX_AUDIO_DURATION = 600
 MAX_CONCURRENT_TASKS = 3
 TASK_CLEANUP_TIME = 3600
 MAX_FILE_SIZE = 50 * 1024 * 1024
 
-# Where to store generated artifacts (CSV/XLSX) for download
 TASK_FILES_DIR = Path("./task_artifacts")
 TASK_FILES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -96,7 +90,7 @@ print(f"hop_length: {hop_length}, n_fft: {n_fft}, n_mels: {n_mels}")
 
 model_kelon = EmoModelKelon(device=device)
 
-ast_epoch_num = None
+ast_epoch_num = 1
 ast_model_path = f"checkpoints/ast_model/model_check_points_ast/check_point_{ast_epoch_num}.pth"
 
 ast_model = EmoModelAST(num_classes=num_classes, freeze_first_n_layers=6)
@@ -106,6 +100,7 @@ ast_model = ast_model.to(device)
 ast_model.eval()
 
 print(f"AST-модель загружена на {device}, эпоха чекпоинта: {ast_epoch_num}")
+
 # =========================================================
 # Transforms
 # =========================================================
@@ -121,7 +116,6 @@ smile = opensmile.Smile(
     feature_level=opensmile.FeatureLevel.LowLevelDescriptors,
 )
 
-
 # =========================================================
 # Executor
 # =========================================================
@@ -136,25 +130,29 @@ active_tasks: int = 0
 
 
 # =========================================================
-# Pydantic models (оставил)
+# Pydantic models
 # =========================================================
 class Segment(BaseModel):
+    """Один временной сегмент с предсказанной эмоцией."""
     label: str
     startFrame: int
     endFrame: int
 
 
 class FeaturesRow(BaseModel):
+    """Одна строка таблицы фич."""
     name: str
     values: List[float]
 
 
 class FeaturesTable(BaseModel):
+    """Таблица фич: названия колонок + строки значений."""
     columns: List[str]
     rows: List[FeaturesRow]
 
 
 class SpectrogramData(BaseModel):
+    """Спектрограмма, закодированная в base64 для передачи на фронт."""
     type: str = "mel"
     frames: int
     melBins: int
@@ -169,6 +167,7 @@ class SpectrogramData(BaseModel):
 # Utils: conversion
 # =========================================================
 def convert_to_wav(input_path: str) -> str:
+    """Конвертирует произвольный аудиофайл в WAV (моно, target_sample_rate) через ffmpeg."""
     output_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
     output_path = output_file.name
     output_file.close()
@@ -198,6 +197,7 @@ def convert_to_wav(input_path: str) -> str:
 # =========================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Запускает фоновые задачи (очистка старых задач, обработка очереди) при старте сервера и останавливает их при завершении."""
     cleanup_task = asyncio.create_task(cleanup_old_tasks())
     queue_task = asyncio.create_task(process_task_queue())
     print("✓ Фоновые задачи запущены: очистка старых задач и обработка очереди")
@@ -238,6 +238,7 @@ app.add_middleware(
 # Cleanup old tasks
 # =========================================================
 async def cleanup_old_tasks():
+    """Фоновый цикл: раз в 5 минут удаляет задачи старше TASK_CLEANUP_TIME из tasks_storage и их файлы фич с диска."""
     while True:
         try:
             await asyncio.sleep(300)
@@ -269,6 +270,7 @@ async def cleanup_old_tasks():
 # Queue processor
 # =========================================================
 async def process_task_queue():
+    """Фоновый цикл: разбирает task_queue и роутит задачи на нужный обработчик (VGG/Kelon/AST) по ключу model_name, ограничивая параллелизм MAX_CONCURRENT_TASKS."""
     global active_tasks
     while True:
         try:
@@ -324,6 +326,7 @@ async def process_audio_with_semaphore(
     stride_ms: int,
     model_name: Optional[str],
 ):
+    """Обёртка над process_audio_tensor (VGG): гарантирует декремент active_tasks даже при ошибке."""
     global active_tasks
     try:
         await process_audio_tensor(task_id, waveform, sample_rate, window_ms, stride_ms, model_name)
@@ -335,12 +338,14 @@ async def process_audio_with_semaphore(
 # Helpers: base64 + features formatting
 # =========================================================
 def numpy_to_base64(array: np.ndarray) -> str:
+    """Кодирует numpy-массив в base64-строку для передачи на фронт."""
     flat_array = array.flatten()
     array_bytes = flat_array.tobytes()
     return base64.b64encode(array_bytes).decode("utf-8")
 
 
 def format_opensmile_features(waveform: torch.Tensor, sample_rate: int, features_dict: Dict[str, float] = None) -> str:
+    """Считает (или форматирует уже готовые) OpenSMILE-фичи и возвращает их в виде CSV-строки."""
     if features_dict is None:
         if isinstance(waveform, torch.Tensor):
             waveform_np = waveform.squeeze().cpu().numpy()
@@ -356,9 +361,7 @@ def format_opensmile_features(waveform: torch.Tensor, sample_rate: int, features
 
 
 def write_opensmile_features_csv(task_id: str, waveform: torch.Tensor, sample_rate: int) -> Path:
-    """Compute OpenSMILE features and write them to a CSV file on disk.
-    Returns the file path.
-    """
+    """Считает OpenSMILE-фичи и сохраняет их в CSV-файл на диске, возвращает путь к файлу."""
     csv_text = format_opensmile_features(waveform, sample_rate)
     out_path = TASK_FILES_DIR / f"{task_id}_features.csv"
     out_path.write_text(csv_text, encoding="utf-8")
@@ -369,12 +372,7 @@ def write_opensmile_features_csv(task_id: str, waveform: torch.Tensor, sample_ra
 # Dataset-compatible preprocessing (ВАЖНО)
 # =========================================================
 def _crop_or_pad_waveform(waveform: torch.Tensor, target_len: int, mode: str = "center") -> torch.Tensor:
-    """
-    Привести waveform к длине target_len сэмплов.
-    mode:
-      - "random"  как в AudioDataset (train)
-      - "center"  детерминированно (лучше для инференса)
-    """
+    """Приводит waveform к длине target_len сэмплов: 'random' обрезка как при обучении, 'center' — детерминированно для инференса."""
     cur_len = int(waveform.shape[1])
 
     if cur_len > target_len:
@@ -393,13 +391,7 @@ def _crop_or_pad_waveform(waveform: torch.Tensor, target_len: int, mode: str = "
 
 
 def _mel_to_model_input(mel_spec: torch.Tensor) -> torch.Tensor:
-    """
-    mel_spec: [1, 80, T]
-    как в AudioDataset:
-      log(mel+1e-6)
-      z-score
-      -> [1, 1, 80, T]
-    """
+    """Приводит [1, 80, T] mel-спектрограмму к формату входа VGG: log + z-score + unsqueeze до [1, 1, 80, T]."""
     mel = torch.log(mel_spec + 1e-6)
     mel = (mel - mel.mean()) / (mel.std() + 1e-6)
 
@@ -412,7 +404,7 @@ def _mel_to_model_input(mel_spec: torch.Tensor) -> torch.Tensor:
 
 
 def _sample_to_frame(sample_idx: int) -> int:
-    # грубая привязка: один mel-frame примерно каждые hop_length сэмплов
+    """Переводит индекс сэмпла waveform в индекс mel-фрейма (грубая привязка через hop_length)."""
     return int(sample_idx // hop_length)
 
 
@@ -423,20 +415,13 @@ def _sample_to_frame(sample_idx: int) -> int:
 async def upload_audio(
     audio: UploadFile = File(..., description="Аудио файл (wav, mp3, flac, ogg, m4a, webm, opus)"),
     test_mode: Optional[bool] = Form(False),
-
-    # ВАЖНО: параметры окна приходят с фронта
     window_ms: Optional[int] = Form(None),
     stride_ms: Optional[int] = Form(None),
-
-    # если фронт шлет modelName/model — примем, но сейчас не используем
     model_name: Optional[str] = Form(None),
 ):
     """
-    Загружаешь аудио. Бэк:
-      - ресемплит в target_sample_rate
-      - считает spectrogram по всей записи
-      - гоняет модель по слайдинговым окнам (window_ms/stride_ms)
-      - каждое окно приводится к train chunk (target_time) и идет в модель
+    Загружает аудиофайл на обработку VGG-моделью через очередь задач.
+    Ставит задачу в task_queue и сразу возвращает task_id для последующего опроса статуса.
     """
     try:
         content = await audio.read()
@@ -448,13 +433,11 @@ async def upload_audio(
 
         task_id = str(uuid.uuid4())
 
-        # дефолты, если фронт не прислал
         if window_ms is None:
             window_ms = int(target_time * 1000)
         if stride_ms is None:
-            stride_ms = int(window_ms)  # по умолчанию без overlap
+            stride_ms = int(window_ms)
 
-        # никаких “защит”/эвристик — берем как есть
         window_ms = int(window_ms)
         stride_ms = int(stride_ms)
 
@@ -486,7 +469,6 @@ async def upload_audio(
             if duration > MAX_AUDIO_DURATION:
                 raise HTTPException(status_code=400, detail=f"Аудио слишком длинное: {duration/60:.2f} мин")
 
-            # mono
             if waveform.dim() == 2 and waveform.shape[0] > 1:
                 waveform = waveform.mean(dim=0, keepdim=True)
 
@@ -542,14 +524,16 @@ async def upload_audio(
 
 @app.get("/api/task/{task_id}")
 async def get_task_status(task_id: str):
+    """Возвращает текущее состояние задачи (status/progress/segments/summary) по task_id. Общий эндпоинт для VGG/Kelon/AST."""
     if task_id not in tasks_storage:
         raise HTTPException(status_code=404, detail="Task not found")
     task = tasks_storage[task_id]
     return {k: v for k, v in task.items() if k not in ["waveform", "sample_rate", "created_at", "features_path"]}
 
+
 @app.get("/api/task/{task_id}/features.csv")
 async def download_features_csv(task_id: str):
-    """Download OpenSMILE features CSV for a finished task."""
+    """Отдаёт CSV-файл с OpenSMILE-фичами для завершённой задачи."""
     if task_id not in tasks_storage:
         raise HTTPException(status_code=404, detail="Task not found")
 
@@ -570,7 +554,7 @@ async def download_features_csv(task_id: str):
 
 
 # =========================================================
-# Main processing
+# Main processing (VGG)
 # =========================================================
 async def process_audio_tensor(
     task_id: str,
@@ -580,32 +564,32 @@ async def process_audio_tensor(
     stride_ms: int,
     model_name: Optional[str],
 ):
+    """
+    Основной обработчик задачи для VGG: ресемплит аудио, считает полную mel-спектрограмму
+    для фронта, нарезает waveform на sliding-window окна, прогоняет каждое через VGG,
+    считает OpenSMILE-фичи и записывает итоговый результат в tasks_storage.
+    """
     try:
         tasks_storage[task_id]["status"] = "processing"
         tasks_storage[task_id]["progress"] = 0.05
 
         loop = asyncio.get_event_loop()
 
-        # mono (на всякий)
         if waveform.dim() == 2 and waveform.shape[0] > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
 
-        # 1) resample exactly as AudioDataset does: torchaudio.functional.resample
         if sample_rate != target_sample_rate:
             waveform = await loop.run_in_executor(executor, F.resample, waveform, sample_rate, target_sample_rate)
             sample_rate = target_sample_rate
 
         tasks_storage[task_id]["progress"] = 0.10
 
-        # 2) compute FULL spectrogram once (for frontend + frame timeline)
-        # IMPORTANT: this is NOT z-score; frontend spectrogram should look stable across whole file
-        full_mel = await loop.run_in_executor(executor, mel_transform, waveform)  # [1, 80, T_full]
-        full_mel_log = torch.log(full_mel + 1e-6)  # [1, 80, T_full]
+        full_mel = await loop.run_in_executor(executor, mel_transform, waveform)
+        full_mel_log = torch.log(full_mel + 1e-6)
         total_frames_full = int(full_mel_log.shape[2])
 
         tasks_storage[task_id]["progress"] = 0.18
 
-        # 3) sliding windows over waveform in SAMPLES
         win_len = int(sample_rate * (window_ms / 1000.0))
         hop_len = int(sample_rate * (stride_ms / 1000.0))
 
@@ -618,14 +602,11 @@ async def process_audio_tensor(
         if total_len <= 0:
             raise RuntimeError("Empty waveform")
 
-        # train chunk size (3 sec)
         train_len = int(sample_rate * target_time)
 
-        # generate start positions to cover whole audio
         starts = list(range(0, max(total_len - 1, 1), hop_len))
         if len(starts) == 0:
             starts = [0]
-        # force last window to cover tail
         if starts[-1] + win_len < total_len:
             starts.append(max(total_len - win_len, 0))
 
@@ -644,28 +625,23 @@ async def process_audio_tensor(
         print(f"windows={n_windows}")
         print(f"{'=' * 60}")
 
-        # 4) run inference per window
         with torch.no_grad():
             for idx, s0 in enumerate(starts):
                 s1 = min(s0 + win_len, total_len)
 
                 window_wave = waveform[:, s0:s1]
-
-                # IMPORTANT: model trained on train_len; so window is mapped to train chunk
-                # (center-crop/pad). This is the most correct way without retraining.
                 window_wave_fixed = _crop_or_pad_waveform(window_wave, train_len, mode="center")
 
-                mel_seg = await loop.run_in_executor(executor, mel_transform, window_wave_fixed)  # [1,80,T_train]
+                mel_seg = await loop.run_in_executor(executor, mel_transform, window_wave_fixed)
                 x = _mel_to_model_input(mel_seg).to(device)
 
-                logits = model(x)  # IMPORTANT: not in executor
+                logits = model(x)
                 probs = torch.softmax(logits, dim=1)
                 pred_class = int(torch.argmax(probs, dim=1).item())
                 emotion_label = label_to_emotion[pred_class]
 
                 predictions.append(emotion_label)
 
-                # map window sample range -> global mel frame range
                 f0 = _sample_to_frame(int(s0))
                 f1 = _sample_to_frame(int(s1))
                 if f0 < 0:
@@ -681,10 +657,8 @@ async def process_audio_tensor(
 
                 segments.append({"label": emotion_label, "startFrame": int(f0), "endFrame": int(f1)})
 
-                # progress (0.18 .. 0.70)
                 tasks_storage[task_id]["progress"] = 0.18 + 0.52 * ((idx + 1) / max(n_windows, 1))
 
-        # 5) summary counts
         emotion_counts = {e: 0 for e in emotion_to_label.keys()}
         for p in predictions:
             emotion_counts[p] += 1
@@ -694,15 +668,13 @@ async def process_audio_tensor(
 
         tasks_storage[task_id]["progress"] = 0.75
 
-        # 6) openSMILE on full waveform (ok)
         waveform_np = waveform.squeeze(0).cpu().numpy()
         features_df = await loop.run_in_executor(executor, smile.process_signal, waveform_np, sample_rate)
         features_data_descriptor = {col: float(features_df[col].iloc[0]) for col in features_df.columns}
 
         tasks_storage[task_id]["progress"] = 0.88
 
-        # 7) spectrogram for frontend: full_mel_log -> uint8
-        mel_for_display = full_mel_log.squeeze(0).transpose(0, 1).cpu().numpy()  # [T_full, 80]
+        mel_for_display = full_mel_log.squeeze(0).transpose(0, 1).cpu().numpy()
 
         mel_min = float(mel_for_display.min())
         mel_max = float(mel_for_display.max())
@@ -716,7 +688,6 @@ async def process_audio_tensor(
 
         tasks_storage[task_id]["progress"] = 0.96
 
-        # 8) finalize
         tasks_storage[task_id].update({
             "status": "done",
             "progress": 1.0,
@@ -752,7 +723,7 @@ async def process_audio_tensor(
 
 
 # =========================================================
-# Mock data (оставил, чтобы тестить фронт)
+# Mock data
 # =========================================================
 MOCK_SPECTROGRAM_BASE64 = (
     "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BB"
@@ -763,6 +734,7 @@ MOCK_SPECTROGRAM_BASE64 = (
 
 
 def create_mock_task_result(task_id: str) -> Dict:
+    """Возвращает фиктивный (mock) результат задачи для тестирования фронта без реального инференса."""
     mock_segments = [
         {"label": "neutral", "startFrame": 0, "endFrame": 100},
         {"label": "positive", "startFrame": 100, "endFrame": 200},
@@ -789,7 +761,7 @@ def create_mock_task_result(task_id: str) -> Dict:
             "emotionCounts": {"neutral": 2, "sad": 0, "angry": 0, "positive": 1},
         },
         "segments": mock_segments,
-        "featuresFile": {"type":"csv","url":"/api/task/mock/features.csv","filename":"mock_features.csv"},
+        "featuresFile": {"type": "csv", "url": "/api/task/mock/features.csv", "filename": "mock_features.csv"},
         "featuresDataDescriptor": mock_features,
         "spectrogram": {
             "type": "mel",
@@ -809,6 +781,7 @@ def create_mock_task_result(task_id: str) -> Dict:
 # =========================================================
 @app.get("/health")
 async def health_check():
+    """Возвращает статус сервера, устройство инференса и флаги загрузки всех трёх моделей."""
     return {
         "status": "healthy",
         "device": str(device),
@@ -840,6 +813,7 @@ async def health_check():
 
 @app.get("/stats")
 async def get_stats():
+    """Возвращает агрегированную статистику по задачам (количество активных/завершённых/ошибочных)."""
     return {
         "status": "healthy",
         "tasks_count": len(tasks_storage),
@@ -854,6 +828,7 @@ async def get_stats():
 
 @app.get("/")
 async def root():
+    """Возвращает общую информацию об API: список моделей, эмоций и доступных эндпоинтов."""
     return {
         "message": "Emotion Recognition API",
         "version": "3.3.0",
@@ -882,6 +857,7 @@ async def root():
 
 @app.delete("/api/task/{task_id}")
 async def delete_task(task_id: str):
+    """Удаляет задачу из tasks_storage вместе с её файлом фич на диске."""
     if task_id not in tasks_storage:
         raise HTTPException(status_code=404, detail="Task not found")
 
@@ -899,6 +875,7 @@ async def delete_task(task_id: str):
 
 @app.get("/api/tasks")
 async def list_tasks():
+    """Возвращает краткий список всех задач в tasks_storage с их статусами."""
     return {
         "total": len(tasks_storage),
         "active": active_tasks,
@@ -920,9 +897,8 @@ async def list_tasks():
 
 
 # =========================================================
-# Полный блок для kelon
+# Kelon
 # =========================================================
-
 async def process_audio_tensor_kelon(
     task_id: str,
     waveform: torch.Tensor,
@@ -930,6 +906,11 @@ async def process_audio_tensor_kelon(
     window_ms: int,
     stride_ms: int,
 ):
+    """
+    Обработчик задачи для Kelon: нарезает waveform на окна,
+    прогоняет каждое через model_kelon.predict_from_waveform,
+    записывает результат в tasks_storage.
+    """
     try:
         tasks_storage[task_id]["status"] = "processing"
         tasks_storage[task_id]["progress"] = 0.05
@@ -994,7 +975,6 @@ async def process_audio_tensor_kelon(
         tasks_storage[task_id]["progress"] = 0.0
 
 
-
 async def process_audio_with_semaphore_kelon(
     task_id: str,
     waveform: torch.Tensor,
@@ -1002,12 +982,15 @@ async def process_audio_with_semaphore_kelon(
     window_ms: int,
     stride_ms: int,
 ):
+    """
+    Обёртка над process_audio_tensor_kelon:
+    гарантирует декремент active_tasks даже при ошибке.
+    """
     global active_tasks
     try:
         await process_audio_tensor_kelon(task_id, waveform, sample_rate, window_ms, stride_ms)
     finally:
         active_tasks -= 1
-
 
 
 @app.post("/api/kelon/upload")
@@ -1016,6 +999,10 @@ async def upload_audio_kelon(
     window_ms: Optional[int] = Form(None),
     stride_ms: Optional[int] = Form(None),
 ):
+    """
+    Загружает аудиофайл на обработку Kelon-моделью через очередь задач,
+    возвращает task_id для опроса статуса.
+    """
     try:
         content = await audio.read()
         if len(content) > MAX_FILE_SIZE:
@@ -1095,9 +1082,8 @@ async def upload_audio_kelon(
 
 
 # =========================================================
-# Полный блок для ast
+# AST
 # =========================================================
-
 async def process_audio_tensor_ast(
         task_id: str,
         waveform: torch.Tensor,
@@ -1105,6 +1091,11 @@ async def process_audio_tensor_ast(
         window_ms: int,
         stride_ms: int,
 ):
+    """
+    Обработчик задачи для AST: нарезает waveform на окна,
+    прогоняет каждое через ast_model.predict_from_waveform,
+    записывает результат в tasks_storage.
+    """
     try:
         tasks_storage[task_id]["status"] = "processing"
         tasks_storage[task_id]["progress"] = 0.05
@@ -1169,7 +1160,6 @@ async def process_audio_tensor_ast(
         tasks_storage[task_id]["progress"] = 0.0
 
 
-
 async def process_audio_with_semaphore_ast(
     task_id: str,
     waveform: torch.Tensor,
@@ -1177,6 +1167,7 @@ async def process_audio_with_semaphore_ast(
     window_ms: int,
     stride_ms: int,
 ):
+    """Обёртка над process_audio_tensor_ast: гарантирует декремент active_tasks даже при ошибке."""
     global active_tasks
     try:
         await process_audio_tensor_ast(task_id, waveform, sample_rate, window_ms, stride_ms)
@@ -1190,6 +1181,7 @@ async def upload_audio_ast(
     window_ms: Optional[int] = Form(None),
     stride_ms: Optional[int] = Form(None),
 ):
+    """Загружает аудиофайл на обработку AST-моделью через очередь задач, возвращает task_id для опроса статуса."""
     try:
         content = await audio.read()
         if len(content) > MAX_FILE_SIZE:
